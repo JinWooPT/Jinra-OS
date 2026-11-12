@@ -1,0 +1,4 @@
+*.sh text eol=lf
+*.py text eol=lf
+/session/jinra-* text eol=lf
+/update/jinra-os-* text eol=lf
