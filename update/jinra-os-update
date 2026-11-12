@@ -1,0 +1,235 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+RELEASES = "https://github.com/JinWooPT/Jinra-OS/releases"
+STATE = Path("/var/lib/jinra-os")
+BASE = Path("/usr/libexec/jinra")
+PUBLIC_KEY = Path("/etc/jinra/releases.pub.pem")
+VERSION = re.compile(r"(?:0|[1-9][0-9]{0,5})(?:\.(?:0|[1-9][0-9]{0,5})){2}")
+RECIPE = re.compile(r"recipes/[0-9A-Fa-f]{16}-[0-9]+-v[0-9]+\.nx2recipe")
+EXECUTABLES = {"jinra", "jinra-capture", "jinra-record-gameplay", "jinra-bluetooth",
+               "jinra-session", "jinra-supervisor"}
+ASSET = "jinra-os-update-linux-x64.tar.gz"
+LIMIT = 512 * 1024 * 1024
+
+
+def version_tuple(text):
+    if not isinstance(text, str) or not VERSION.fullmatch(text):
+        raise ValueError("Invalid Jinra OS release version.")
+    return tuple(map(int, text.split(".")))
+
+
+class ReleaseRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlsplit(newurl)
+        if target.scheme != "https" or target.hostname not in {
+            "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"
+        }:
+            raise ValueError("Unexpected download server for a Jinra OS release.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_release(url):
+    return build_opener(ReleaseRedirect()).open(Request(url, headers={"User-Agent": "Jinra OS Updater"}), timeout=30)
+
+
+def read_asset(url, limit):
+    with open_release(url) as response:
+        value = response.read(limit + 1)
+    if len(value) > limit:
+        raise ValueError("Jinra OS release metadata is too large.")
+    return value
+
+
+def verify_manifest(raw, signature, key=PUBLIC_KEY):
+    if len(signature) != 64:
+        raise ValueError("Invalid Jinra OS release signature.")
+    with tempfile.TemporaryDirectory(prefix="jinra-release-") as folder:
+        message = Path(folder, "manifest")
+        proof = Path(folder, "signature")
+        message.write_bytes(raw)
+        proof.write_bytes(signature)
+        checked = subprocess.run(["/usr/bin/openssl", "pkeyutl", "-verify", "-pubin", "-rawin",
+                                  "-inkey", str(key), "-in", str(message), "-sigfile", str(proof)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if checked.returncode:
+        raise ValueError("The Jinra OS release signature could not be verified.")
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("asset") != ASSET:
+        raise ValueError("This Jinra OS release uses an unsupported update format.")
+    version_tuple(manifest.get("version"))
+    if (type(manifest.get("size")) is not int or not 0 < manifest["size"] <= LIMIT
+            or not isinstance(manifest.get("sha256"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", manifest["sha256"])):
+        raise ValueError("Invalid Jinra OS update size or checksum.")
+    return manifest
+
+
+def release_manifest(prefix, allow_empty=False):
+    try:
+        raw = read_asset(f"{prefix}/jinra-os-update.json", 16384)
+    except HTTPError as error:
+        if allow_empty and error.code == 404:
+            return None
+        raise
+    signature = read_asset(f"{prefix}/jinra-os-update.sig", 64)
+    return verify_manifest(raw, signature)
+
+
+def selected_runtime(state=STATE, base=BASE):
+    pointer = state / "current"
+    if not pointer.is_symlink():
+        return base
+    slot = pointer.readlink()
+    if slot.parts[:1] != ("versions",) or len(slot.parts) != 2:
+        raise ValueError("Invalid installed Jinra OS release path.")
+    version_tuple(slot.name)
+    return state / slot
+
+
+def installed_version(runtime):
+    value = (runtime / "os-version").read_text(encoding="ascii").strip()
+    version_tuple(value)
+    return value
+
+
+def check():
+    runtime = selected_runtime()
+    current = installed_version(runtime)
+    active = os.environ.get("JINRA_OS_RUNTIME")
+    fallback = os.environ.get("JINRA_OS_RUNTIME_FALLBACK") == "1"
+    if active and Path(active) != runtime and not fallback:
+        print(f"pending\t{current}")
+        return
+    latest = release_manifest(f"{RELEASES}/latest/download", allow_empty=True)
+    if latest and version_tuple(latest["version"]) > version_tuple(current):
+        print(f"available\t{current}\t{latest['version']}")
+    elif fallback:
+        print(f"fallback\t{current}")
+    else:
+        print(f"current\t{current}")
+
+
+def download_package(prefix, manifest, archive):
+    digest = hashlib.sha256()
+    size = 0
+    with open_release(f"{prefix}/{ASSET}") as stream, archive.open("xb") as output:
+        while chunk := stream.read(1024 * 1024):
+            size += len(chunk)
+            if size > manifest["size"]:
+                raise ValueError("The update is larger than the signed release size.")
+            digest.update(chunk)
+            output.write(chunk)
+    if size != manifest["size"] or digest.hexdigest() != manifest["sha256"]:
+        raise ValueError("The Jinra OS download failed verification.")
+
+
+def unpack(archive, destination):
+    total = 0
+    files = set()
+    with tarfile.open(archive, "r|gz") as package:
+        for member in package:
+            path = member.name
+            if (not member.isfile() or path in files
+                    or (path not in EXECUTABLES and not RECIPE.fullmatch(path))):
+                raise ValueError(f"Unexpected file in Jinra OS update: {path!r}.")
+            total += member.size
+            if member.size <= 0 or total > LIMIT:
+                raise ValueError("The expanded Jinra OS update is too large or incomplete.")
+            target = destination / path
+            target.parent.mkdir(exist_ok=True)
+            with package.extractfile(member) as source, target.open("xb") as output:
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+            target.chmod(0o755 if path in EXECUTABLES else 0o644)
+            files.add(path)
+    if not EXECUTABLES.issubset(files):
+        raise ValueError("The Jinra OS update is missing required programs.")
+
+
+def validate_runtime(runtime, base):
+    for model in base.glob("libnvidia-ngx-dlss.so.*"):
+        (runtime / model.name).symlink_to(model)
+    for name in ("jinra", "jinra-bluetooth", "jinra-capture"):
+        result = subprocess.run(["/usr/bin/ldd", str(runtime / name)], capture_output=True, check=True)
+        if b"not found" in result.stdout:
+            raise ValueError("The Jinra OS update needs libraries that are missing from this system.")
+
+
+def activate(state, destination):
+    with tempfile.TemporaryDirectory(dir=state, prefix=".activate-") as folder:
+        pointer = Path(folder, "current")
+        pointer.symlink_to(destination.relative_to(state))
+        os.replace(pointer, state / "current")
+        directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def install(version, state=STATE, base=BASE):
+    requested = version_tuple(version)
+    with (state / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = selected_runtime(state, base)
+        if requested <= version_tuple(installed_version(previous)):
+            raise ValueError("Only a newer version of Jinra OS can be installed.")
+        prefix = f"{RELEASES}/download/v{version}"
+        manifest = release_manifest(prefix)
+        if manifest["version"] != version:
+            raise ValueError("The signed update does not match the selected version.")
+        versions = state / "versions"
+        versions.mkdir(exist_ok=True)
+        destination = versions / version
+        with tempfile.TemporaryDirectory(dir=state, prefix=".download-") as folder:
+            archive = Path(folder, ASSET)
+            staged = Path(folder, "runtime")
+            staged.mkdir(mode=0o755)
+            download_package(prefix, manifest, archive)
+            unpack(archive, staged)
+            validate_runtime(staged, base)
+            (staged / "os-version").write_text(f"{version}\n", encoding="ascii")
+            if destination.exists():
+                # A prior interrupted install may have finished staging without switching the pointer.
+                shutil.rmtree(destination)
+            staged.rename(destination)
+            subprocess.run(["/usr/bin/sync", "-f", str(destination)], check=True)
+            activate(state, destination)
+        for old in versions.iterdir():
+            if old not in (previous, destination) and VERSION.fullmatch(old.name) and old.is_dir():
+                shutil.rmtree(old, ignore_errors=True)
+    print(f"Jinra OS {version} installed. Restart to activate it.")
+
+
+def main():
+    if sys.argv[1:] == ["check"]:
+        check()
+    elif len(sys.argv) == 3 and sys.argv[1] == "install" and os.geteuid() == 0:
+        install(sys.argv[2])
+    else:
+        raise ValueError("Usage: jinra-os-update check | install VERSION (system service)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)

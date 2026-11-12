@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+drm=${1:-/sys/class/drm}
+runtime=${2:-/run/jinra}
+config=${3:-/etc/jinra/primary-monitor}
+[ -r "$config" ] || exit 0
+read -r wanted < "$config"
+
+for attempt in 1 2 3 4 5 6 7 8; do
+    primary=
+    matches=0
+    for connector in "$drm"/card[0-9]*-*; do
+        [ -r "$connector/status" ] && [ -r "$connector/edid" ] || continue
+        [ "$(cat "$connector/status")" = connected ] || continue
+        monitor=$(od -An -tx1 -j8 -N4 "$connector/edid" 2>/dev/null | tr -d '[:space:]')
+        [ "$monitor" = "$wanted" ] || continue
+        primary=$connector
+        matches=$((matches + 1))
+    done
+    [ "$matches" = 1 ] && break
+    [ "$attempt" = 8 ] || sleep 1
+done
+
+if [ "$matches" != 1 ]; then
+    printf 'No unique connected monitor matches EDID %s. Using automatic display selection.\n' "$wanted"
+    exit 0
+fi
+
+output=${primary##*/}
+output=${output#*-}
+printf '%s\n' "$output" > "$runtime/primary-output"
+printf 'Selected %s for EDID %s.\n' "$output" "$wanted"
+
+for connector in "$drm"/card[0-9]*-*; do
+    [ "$connector" != "$primary" ] && [ -r "$connector/status" ] || continue
+    [ "$(cat "$connector/status")" = connected ] || continue
+    if printf 'off\n' > "$connector/status"; then
+        printf 'Disabled %s for this boot.\n' "${connector##*/}"
+    fi
+done

@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" != --logged ]; then
+    exec /usr/bin/systemd-cat --identifier=jinra-session -- "$0" --logged
+fi
+
+export JINRA_CONSOLE_SESSION=1
+export XDG_CURRENT_DESKTOP=Jinra
+export XDG_SESSION_TYPE=wayland
+if [ -r /etc/jinra/shader-translator-legacy ] &&
+   read -r JINRA_OS_LEGACY_SHADER_FINGERPRINT JINRA_OS_LEGACY_SHADER_TRANSLATOR < /etc/jinra/shader-translator-legacy; then
+    export JINRA_OS_LEGACY_SHADER_FINGERPRINT JINRA_OS_LEGACY_SHADER_TRANSLATOR
+fi
+mkdir -p "$HOME/Games"
+cd "$HOME"
+mkdir -p user/keys
+if [ ! -f user/keys/prod.keys ]; then
+    for library in Games Library; do
+        if [ -f "$library/Setup/prod.keys" ]; then
+            install -m 600 "$library/Setup/prod.keys" user/keys/prod.keys
+            break
+        fi
+    done
+fi
+if mountpoint -q "$HOME/Games" && mkdir -p "$HOME/Games/Diagnostics"; then
+    export JINRA_DIAGNOSTICS_DIR="$HOME/Games/Diagnostics"
+    export EDEN_NX2_STUTTER_TRACE=1
+fi
+if mountpoint -q "$HOME/Games"; then
+    export JINRA_RECORDINGS_DIR="$HOME/Games/Recordings"
+fi
+
+if [ -x /usr/bin/bluetoothctl ]; then
+    (
+        export LC_ALL=C
+        timeout 5 /usr/bin/bluetoothctl --timeout 4 power on >/dev/null 2>&1 || exit 0
+        /usr/bin/bluetoothctl devices Paired 2>/dev/null | while read -r kind address name; do
+            case "$kind $name" in
+                'Device DualSense'*)
+                    info=$(timeout 4 /usr/bin/bluetoothctl info "$address" 2>/dev/null) || continue
+                    if printf '%s\n' "$info" | grep -q 'Trusted: yes' &&
+                       printf '%s\n' "$info" | grep -q 'Connected: no'; then
+                        timeout 8 /usr/bin/bluetoothctl --timeout 7 connect "$address" >/dev/null 2>&1 || true
+                    fi
+                    ;;
+            esac
+        done
+    ) &
+fi
+
+set -- --backend drm
+if [ -r /etc/jinra/display-mode ] && read -r width height refresh < /etc/jinra/display-mode; then
+    if [ -n "$width" ] && [ -n "$height" ] && [ -n "$refresh" ]; then
+        case "$width$height$refresh" in
+            *[!0-9]*) ;;
+            *) set -- "$@" -W "$width" -H "$height" -r "$refresh" ;;
+        esac
+    fi
+fi
+if [ -r /run/jinra/primary-output ] && read -r output < /run/jinra/primary-output && [ -n "$output" ]; then
+    set -- "$@" --prefer-output "$output"
+fi
+
+supervisor=/usr/local/libexec/jinra-supervisor
+emulator=/usr/bin/jinra
+if [ -n "${JINRA_OS_RUNTIME:-}" ]; then
+    supervisor="$JINRA_OS_RUNTIME/jinra-supervisor"
+    emulator="$JINRA_OS_RUNTIME/jinra"
+fi
+exec "$supervisor" /usr/games/gamescope "$@" -- \
+    /usr/bin/env QT_QPA_PLATFORM=xcb SDL_VIDEODRIVER=x11 "$emulator"

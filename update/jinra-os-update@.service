@@ -1,0 +1,14 @@
+[Unit]
+Description=Install signed Jinra OS release %i
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/jinra-os-update install %i
+TimeoutStartSec=20min
+StateDirectory=jinra-os
+UMask=0022
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+NoNewPrivileges=yes

@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def stop_jinra(request):
+    try:
+        pid = int(request.read_text())
+        pid_fd = os.pidfd_open(pid)
+    except (OSError, ValueError):
+        return
+    try:
+        runtime = os.environ.get("JINRA_OS_RUNTIME")
+        executable = Path(runtime, "jinra") if runtime else Path("/usr/bin/jinra")
+        if Path(f"/proc/{pid}/exe").resolve() == executable.resolve():
+            signal.pidfd_send_signal(pid_fd, signal.SIGKILL)
+    except OSError:
+        pass
+    finally:
+        os.close(pid_fd)
+
+
+def supervise(command, request, shutdown_timeout=15):
+    environment = dict(os.environ, JINRA_RETURN_HOME_REQUEST=str(request))
+    failures = 0
+    while failures < 3:
+        request.unlink(missing_ok=True)
+        print("Starting Jinra through XWayland.", flush=True)
+        with subprocess.Popen(command, env=environment) as compositor:
+            deadline = None
+            compositor_fd = os.pidfd_open(compositor.pid)
+            try:
+                poller = select.poll()
+                poller.register(compositor_fd, select.POLLIN)
+                while not poller.poll(500):
+                    if deadline is None and request.is_file():
+                        deadline = time.monotonic() + shutdown_timeout
+                    if deadline is None or time.monotonic() < deadline:
+                        continue
+                    print("Jinra return to Home timed out. Restarting the graphical session.",
+                          flush=True)
+                    stop_jinra(request)
+                    compositor.terminate()
+                    if not poller.poll(2000):
+                        compositor.kill()
+                    break
+            finally:
+                os.close(compositor_fd)
+        if request.is_file():
+            stop_jinra(request)
+            failures = 0
+            continue
+        failures += 1
+        print(f"The graphical session exited with status {compositor.returncode}.", flush=True)
+        if failures < 3:
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="jinra-session-", dir=os.environ.get("XDG_RUNTIME_DIR")) as state:
+        supervise(sys.argv[1:], Path(state) / "return-home")

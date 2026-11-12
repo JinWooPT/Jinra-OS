@@ -1,0 +1,9 @@
+polkit.addRule(function(action, subject) {
+    var unit = action.lookup("unit");
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("verb") === "start" && subject.user === "jinra" &&
+        subject.local && subject.active && typeof unit === "string" &&
+        /^jinra-os-update@[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}\.service$/.test(unit)) {
+        return polkit.Result.YES;
+    }
+});

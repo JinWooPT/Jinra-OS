@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+base=/usr/libexec/jinra
+state=/var/lib/jinra-os
+runtime=$(readlink -f "$state/current" 2>/dev/null || true)
+case "$runtime" in
+    "$state"/versions/*)
+        if [ -x "$runtime/jinra" ] && [ -x "$runtime/jinra-session" ]; then
+            if ! JINRA_OS_RUNTIME="$runtime" "$runtime/jinra-session" "$@"; then
+                printf 'Jinra OS release session exited. Starting the original runtime.\n' >&2
+            fi
+            export JINRA_OS_RUNTIME_FALLBACK=1
+        fi
+        ;;
+esac
+export JINRA_OS_RUNTIME="$base"
+exec "$base/jinra-session" "$@"

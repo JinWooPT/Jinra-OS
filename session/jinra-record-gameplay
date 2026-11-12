@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+output=${1:?Expected a recording output path}
+frames=${2:?Expected a shared video buffer descriptor}
+sink=$(timeout 1 pactl get-default-sink 2>/dev/null) || sink=
+printf 'Receiving video directly from the Jinra Vulkan renderer.\n' >&2
+helper="$(dirname -- "$0")/jinra-capture"
+if [ ! -x "$helper" ]; then helper=/usr/local/libexec/jinra-capture; fi
+exec "$helper" "$output" "$frames" "$sink"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Select the Jinra OS display
+Before=greetd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=jinra
+ExecStart=/usr/local/bin/jinra-select-display
+
+[Install]
+WantedBy=greetd.service
